@@ -1,0 +1,79 @@
+# Production stack for the homelab: database, API and nightly backups.
+#
+#   cp .env.production.example .env.production   (then fill it in)
+#   sh deploy.sh
+#
+# The API is published on 127.0.0.1 only: nothing on the LAN can reach it. The Cloudflare Tunnel already running
+# on the homelab (cloudflared on the host) forwards the public hostname to http://127.0.0.1:3200.
+name: oracle-prod
+
+services:
+  db:
+    # Stays on 18: the existing production data directory was written by PostgreSQL 18 and will not start on 19.
+    # Moving to 19 needs a dump and restore, see "Upgrading PostgreSQL" in docs/DEPLOY.md.
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-oracle}
+    volumes:
+      - db-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: oracle-api:latest
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: "3200"
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-oracle}
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?set BETTER_AUTH_SECRET (openssl rand -base64 32)}
+      API_URL: ${API_URL:?set API_URL to the public https address}
+      SIGNUP_MODE: ${SIGNUP_MODE:-closed}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      AI_BASE_URL: ${AI_BASE_URL:-}
+      AI_API_KEY: ${AI_API_KEY:-}
+      AI_MODEL: ${AI_MODEL:-deepseek-v4.1-flash}
+      AI_RATE_PER_HOUR: ${AI_RATE_PER_HOUR:-40}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_SECURE: ${SMTP_SECURE:-}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      RUN_MIGRATIONS: "true"
+    ports:
+      - "127.0.0.1:3200:3200"
+
+  # A compressed dump of the database every BACKUP_INTERVAL_SECONDS (default 24 hours), old ones deleted after KEEP_DAYS.
+  backup:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGHOST: db
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB:-oracle}
+      KEEP_DAYS: ${BACKUP_KEEP_DAYS:-14}
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
+    volumes:
+      - ./backup/backup.sh:/backup.sh:ro
+      - ${BACKUP_DIR:-./backups}:/backups
+    command: ["sh", "/backup.sh"]
+
+volumes:
+  db-data:

@@ -1,0 +1,31 @@
+{
+  "name": "oracle-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Oracle backend: the REST API, the database code and the deploy files.",
+  "workspaces": [
+    "api",
+    "db",
+    "vendor/oracle/shared/core"
+  ],
+  "scripts": {
+    "db:up": "docker compose --env-file .env -f docker-compose.dev.yml up -d db",
+    "db:generate": "npm run generate -w @oracle/db",
+    "db:migrate": "npm run migrate -w @oracle/db",
+    "db:seed": "npm run seed -w @oracle/db",
+    "db:studio": "npm run studio -w @oracle/db",
+    "dev": "npm run dev -w @oracle/api",
+    "start": "npm run start -w @oracle/api",
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "eslint"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "drizzle-kit": "^0.31.11",
+    "eslint": "^10.15.0",
+    "tsx": "^4.23.15",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.73.0"
+  }
+}

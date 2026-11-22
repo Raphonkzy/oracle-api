@@ -1,0 +1,52 @@
+# ---- Dependencies
+node_modules/
+
+# ---- Secrets: never commit. Keep the *.example files instead.
+.env
+.env.*
+!.env.example
+!**/.env.example
+!.env.production.example
+!**/.env.production.example
+*.pem
+*.key
+*.p12
+*.jks
+*.keystore
+
+# ---- Backups and dumps (contain personal financial data)
+backups/
+*.sql.gz
+# Dumps are *.sql files in backups/ (ignored above). Migrations are *.sql too, and they must be tracked.
+
+# ---- Build output and caches
+dist/
+build/
+out/
+.next/
+.expo/
+*.tsbuildinfo
+next-env.d.ts
+expo-env.d.ts
+coverage/
+
+# ---- Generated native projects (Expo prebuild). Configure native behaviour in app.json instead.
+/mobile/android/
+/mobile/ios/
+
+# ---- Logs and editor/OS noise
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Built phone apps
+/apk/
+
+# Notes for coding agents (kept on the owner's machine only)
+AGENTS.md

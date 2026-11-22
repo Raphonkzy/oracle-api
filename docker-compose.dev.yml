@@ -1,0 +1,26 @@
+# Local development: PostgreSQL only. Start it from the repository root with `npm run db:up`.
+# The production stack (api, db, backups, tunnel) is docker-compose.prod.yml.
+name: oracle
+
+services:
+  db:
+    image: postgres:19-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-oracle}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-oracle_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-oracle}
+    ports:
+      # Bound to localhost only, never exposed to the network.
+      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      # Postgres 18+ images expect the volume at /var/lib/postgresql
+      - db-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  db-data:

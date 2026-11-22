@@ -1,0 +1,3 @@
+[submodule "vendor/oracle"]
+	path = vendor/oracle
+	url = https://github.com/Raphonkzy/oracle.git

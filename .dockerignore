@@ -1,0 +1,12 @@
+# The image is built from the repository root, but only the server and the shared logic it uses go in.
+# Everything is excluded first, then the needed parts are let back in. Secrets, backups and the rest never reach the image.
+*
+!package.json
+!package-lock.json
+!api/package.json
+!api/src
+!db/package.json
+!db/src
+!db/drizzle
+!vendor/oracle/shared/core/package.json
+!vendor/oracle/shared/core/src

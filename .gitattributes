@@ -1,0 +1,12 @@
+# Store text with LF line endings in the repository. Windows checkouts still get CRLF where the tools need it.
+* text=auto eol=lf
+# Scripts must keep LF, or the shell on the homelab refuses them.
+*.sh text eol=lf
+# Binary files are never changed by git's line-ending logic.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ttf binary
+*.otf binary
+*.gz binary
+*.sql text eol=lf

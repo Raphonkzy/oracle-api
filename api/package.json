@@ -1,0 +1,30 @@
+{
+  "name": "@oracle/api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch --env-file=../.env src/server.ts",
+    "start": "tsx --env-file=../.env src/server.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --env-file=../.env --import tsx --test --test-concurrency=1 \"test/**/*.test.ts\"",
+    "start:prod": "node --import tsx src/server.ts"
+  },
+  "dependencies": {
+    "@better-auth/expo": "^1.7.27",
+    "@hono/node-server": "^2.1.11",
+    "@oracle/core": "*",
+    "@oracle/db": "*",
+    "better-auth": "^1.7.27",
+    "drizzle-orm": "^0.45.4",
+    "hono": "^4.13.20",
+    "nodemailer": "^10.6.1",
+    "postgres": "^4.1.1",
+    "tsx": "^4.23.15",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/nodemailer": "^8.0.2"
+  }
+}
