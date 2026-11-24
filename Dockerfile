@@ -19,6 +19,8 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json ./
 COPY api api
+# The lockfile keeps some server packages (@better-auth/expo, better-auth) in api/node_modules, not at the root.
+COPY --from=deps /app/api/node_modules ./api/node_modules
 COPY db db
 COPY vendor/oracle/shared/core vendor/oracle/shared/core
 USER node
