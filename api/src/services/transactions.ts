@@ -1,9 +1,9 @@
-import { FEE_CATEGORY, LEGACY_FEE_CATEGORY, isISODate, monthRange, type LedgerRow, type Page, type TransactionInput, type TransferInput } from "@oracle/core";
+import { FEE_CATEGORY, firstError, LEGACY_FEE_CATEGORY, isISODate, monthRange, transferInput, type LedgerRow, type Page, type TransactionInput, type TransferInput, type TransferPatchInput } from "@oracle/core";
 import type { Db } from "@oracle/db/client";
 import { balanceChecks, categories, transactions, transfers } from "@oracle/db/schema";
 import { and, eq, inArray, isNull, sql, type SQL } from "drizzle-orm";
 import { z } from "zod";
-import { badRequest, notFound } from "../errors";
+import { badRequest, HttpError, notFound } from "../errors";
 import { assertActiveAccounts, getAccount } from "./accounts";
 import { guardOverdraft, snapshot } from "./balance";
 import type { Tx } from "./types";
@@ -244,31 +244,124 @@ export async function deleteTransaction(db: Db, userId: string, id: string) {
       .from(transactions)
       .where(and(eq(transactions.userId, userId), eq(transactions.id, id)));
     if (!row) throw notFound("Transaction not found.");
-    // Removing money that came in (income, or the receiving side of a transfer) can leave an account short.
-    const touched = row.transferId
-      ? (await tx.select({ accountId: transactions.accountId }).from(transactions).where(eq(transactions.transferId, row.transferId))).map((r) => r.accountId)
-      : [row.accountId];
-    await guardOverdraft(tx, touched, async () => {
+    if (row.transferId) return deleteTransferIn(tx, userId, row.transferId);
+    // Removing money that came in (income) can leave an account short.
+    await guardOverdraft(tx, [row.accountId], async () => {
       await tx.update(balanceChecks).set({ adjustmentTransactionId: null }).where(eq(balanceChecks.adjustmentTransactionId, id));
-      if (row.transferId) await tx.delete(transfers).where(and(eq(transfers.userId, userId), eq(transfers.id, row.transferId)));
-      else await tx.delete(transactions).where(and(eq(transactions.userId, userId), eq(transactions.id, id)));
+      await tx.delete(transactions).where(and(eq(transactions.userId, userId), eq(transactions.id, id)));
     });
   });
+}
+
+/** Deletes a transfer with its legs and fee row. Throws `not_found` when it does not exist or belongs to another person. */
+export async function deleteTransfer(db: Db, userId: string, transferId: string) {
+  await db.transaction((tx) => deleteTransferIn(tx, userId, transferId));
+}
+
+async function deleteTransferIn(tx: Tx, userId: string, transferId: string) {
+  const [cur] = await tx
+    .select({ fromAccountId: transfers.fromAccountId, toAccountId: transfers.toAccountId })
+    .from(transfers)
+    .where(and(eq(transfers.userId, userId), eq(transfers.id, transferId)))
+    .for("update");
+  if (!cur) throw notFound("Transfer not found.");
+  await guardOverdraft(tx, [cur.fromAccountId, cur.toAccountId], async () => {
+    // The legs and the fee row go with the transfer through the cascade.
+    await tx.delete(transfers).where(and(eq(transfers.userId, userId), eq(transfers.id, transferId)));
+  });
+}
+
+const transferRows = async (db: Db | Tx, userId: string, transferId: string) =>
+  ((await db.execute(sql`${baseSelect} where t.user_id = ${userId} and t.transfer_id = ${transferId} order by t.created_at`)) as unknown as RawRow[]).map(toRow);
+
+/** Edits a transfer. The patch is merged into the current values and checked like a new transfer, then the legs are written again. */
+export async function updateTransfer(db: Db, userId: string, transferId: string, patch: TransferPatchInput): Promise<LedgerRow[]> {
+  await db.transaction(async (tx) => {
+    const [cur] = await tx
+      .select()
+      .from(transfers)
+      .where(and(eq(transfers.userId, userId), eq(transfers.id, transferId)))
+      .for("update");
+    if (!cur) throw notFound("Transfer not found.");
+    const parsed = transferInput.safeParse({
+      fromAccountId: patch.fromAccountId ?? cur.fromAccountId,
+      toAccountId: patch.toAccountId ?? cur.toAccountId,
+      amount: patch.amount ?? cur.amount,
+      fee: patch.fee ?? cur.fee,
+      date: patch.date ?? cur.date,
+      note: patch.note === undefined ? cur.note : patch.note,
+    });
+    if (!parsed.success) throw new HttpError(400, "validation", firstError(parsed.error));
+    const next = parsed.data;
+    await assertActiveAccounts(tx, userId, [next.fromAccountId, next.toAccountId]);
+    await guardOverdraft(tx, [cur.fromAccountId, cur.toAccountId, next.fromAccountId, next.toAccountId], async () => {
+      await tx.delete(transactions).where(eq(transactions.transferId, transferId));
+      await tx.update(transfers).set(next).where(eq(transfers.id, transferId));
+      await insertLegs(tx, userId, transferId, next);
+    });
+  });
+  return transferRows(db, userId, transferId);
 }
 
 export async function createTransfer(db: Db, userId: string, d: TransferInput): Promise<LedgerRow[]> {
   const transferId = await db.transaction(async (tx) => {
     await assertActiveAccounts(tx, userId, [d.fromAccountId, d.toAccountId]);
     // The source pays the amount and the fee from its own balance.
-    return guardOverdraft(tx, [d.fromAccountId, d.toAccountId], () => insertTransfer(tx, userId, d));
+    return guardOverdraft(tx, [d.fromAccountId, d.toAccountId], async () => {
+      const id = await insertTransferRow(tx, userId, d);
+      await insertLegs(tx, userId, id, d);
+      return id;
+    });
   });
-  const rows = await db.execute(sql`${baseSelect} where t.user_id = ${userId} and t.transfer_id = ${transferId} order by t.created_at`);
-  return (rows as unknown as RawRow[]).map(toRow);
+  return transferRows(db, userId, transferId);
+}
+
+export type TransferDetail = {
+  id: string;
+  fromAccountId: string;
+  fromAccountName: string;
+  toAccountId: string;
+  toAccountName: string;
+  amount: number;
+  fee: number;
+  date: string;
+  note: string | null;
+};
+
+/** Reads one transfer with its account names. Returns null when it does not exist or belongs to another person. */
+export async function getTransfer(db: Db | Tx, userId: string, transferId: string): Promise<TransferDetail | null> {
+  const rows = (await db.execute(sql`
+    select tr.id, tr.from_account_id as "fromAccountId", fa.name as "fromAccountName",
+           tr.to_account_id as "toAccountId", ta.name as "toAccountName",
+           tr.amount::bigint as amount, tr.fee::bigint as fee, tr.date::text as date, tr.note
+    from transfers tr
+    join money_accounts fa on fa.id = tr.from_account_id
+    join money_accounts ta on ta.id = tr.to_account_id
+    where tr.user_id = ${userId} and tr.id = ${transferId}`)) as unknown as RawRow[];
+  const r = rows[0];
+  if (!r) return null;
+  return {
+    id: r.id as string,
+    fromAccountId: r.fromAccountId as string,
+    fromAccountName: r.fromAccountName as string,
+    toAccountId: r.toAccountId as string,
+    toAccountName: r.toAccountName as string,
+    amount: Number(r.amount),
+    fee: Number(r.fee),
+    date: r.date as string,
+    note: (r.note as string | null) ?? null,
+  };
+}
+
+/** Creates the `transfers` row only. The legs are written by `insertLegs`. */
+async function insertTransferRow(tx: Tx, userId: string, d: TransferInput): Promise<string> {
+  const [tr] = await tx.insert(transfers).values({ ...d, userId }).returning({ id: transfers.id });
+  return tr.id;
 }
 
 /** Books the transfer: money out of the source, money into the target, and an optional fee on the source. Neither side is income or expense. */
-async function insertTransfer(tx: Tx, userId: string, d: TransferInput): Promise<string> {
-  const [tr] = await tx.insert(transfers).values({ ...d, userId }).returning({ id: transfers.id });
+async function insertLegs(tx: Tx, userId: string, transferId: string, d: TransferInput): Promise<void> {
+  const tr = { id: transferId };
   // The legs share one transaction, so now() would be identical. One microsecond apart keeps their order fixed: out, in, fee.
   const at = (n: number) => sql`now() + ${n}::int * interval '1 microsecond'`;
   const out = { userId, accountId: d.fromAccountId, kind: "transfer_out" as const, amount: -d.amount, date: d.date, note: d.note, transferId: tr.id, createdAt: at(0) };
@@ -296,7 +389,6 @@ async function insertTransfer(tx: Tx, userId: string, d: TransferInput): Promise
   } else {
     await tx.insert(transactions).values([out, into]);
   }
-  return tr.id;
 }
 
 /** "Balance update": records the real balance and books the difference as an adjustment. */

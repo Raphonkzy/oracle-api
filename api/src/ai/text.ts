@@ -12,16 +12,22 @@ export function clean(value: unknown, max = 60): string {
 /** A name or note that may carry anything: clean it and make sure it cannot pose as a tag we use around data. */
 export const safeLabel = (value: unknown, max = 40) => clean(value, max).replace(/[<>]/g, "");
 
-/** Cuts a reply at a sentence end when it is too long. */
-export function limitReply(text: string, max = 1500): string {
+/** Cuts a reply at the last sentence end inside the limit. Without a sentence end, cuts at the limit. */
+export function limitReply(text: string, max = 4000): string {
   const t = text.trim();
   if (t.length <= max) return t;
-  const cut = t.slice(0, max);
-  const end = Math.max(cut.lastIndexOf(". "), cut.lastIndexOf("\n"));
-  return `${(end > max * 0.5 ? cut.slice(0, end + 1) : cut).trim()}…`;
-}
-
-/** Code blocks, links and pictures never belong in an answer about the person's own money. */
-export function looksOffTopic(reply: string): boolean {
-  return /```|~~~|https?:\/\/|www\.|\]\(|<\s*(script|iframe|img|a)\b/i.test(reply);
+  const slice = t.slice(0, max);
+  let end = -1;
+  for (let i = slice.length - 1; i >= 0; i -= 1) {
+    const ch = slice[i];
+    if (ch === "\n") {
+      end = i;
+      break;
+    }
+    if ((ch === "." || ch === "!" || ch === "?") && (i === slice.length - 1 || /\s/.test(slice[i + 1]))) {
+      end = i + 1;
+      break;
+    }
+  }
+  return (end > 0 ? slice.slice(0, end) : slice).trim();
 }

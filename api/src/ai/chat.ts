@@ -3,9 +3,11 @@ import type { Db } from "@oracle/db/client";
 import { listAccounts } from "../services/accounts";
 import { listCategories } from "../services/catalog";
 import type { AiClient, ChatMessage } from "./client";
-import { chatSystemPrompt, groundingFallbackFor, noAnswerFor, refusalFor } from "./prompts";
+import { chatSystemPrompt, groundingFallbackFor, noAnswerFor, redirectFallbackFor } from "./prompts";
+import { logCheck, normalizePlainText, rejectRule, stripReasoning } from "./checks";
+import { writeRedirect } from "./redirect";
 import { isInScope } from "./scope";
-import { limitReply, looksOffTopic, safeLabel } from "./text";
+import { limitReply, safeLabel } from "./text";
 import { TOOL_SPECS, runTool, type ToolContext } from "./tools";
 
 /** How many times the model may call tools before it has to answer. A hard stop against loops. */
@@ -18,18 +20,20 @@ type Deps = { client: AiClient; db: Db; userId: string; today: string; messages:
 
 /**
  * One assistant turn. In order, and each step is enforced here in code, not left to the model:
- *   1. scope check (anything outside the person's own money in Oracle gets a fixed refusal, with no model call and no tools)
+ *   1. scope gate (only the exact verdict `true` goes on; anything else gets a Redirect: one call, no tools)
  *   2. tool loop (read-only tools, at most MAX_STEPS rounds)
- *   3. leak check (the answer may not contain the internal marker)
+ *   3. reply checks (reasoning removed, then marker, code, link, tag and table rejects, then plain-text normalization)
  *   4. number check (every amount and percentage must come from the data or from what the person wrote)
+ *   5. length cap, last, so the checks see the whole reply
  */
 export async function runChat({ client, db, userId, today, messages, language = "en", view }: Deps): Promise<AiChatResponse> {
-  const REFUSAL = refusalFor(language);
+  const REDIRECT_FALLBACK = redirectFallbackFor(language);
   const NO_ANSWER = noAnswerFor(language);
   const GROUNDING_FALLBACK = groundingFallbackFor(language);
-  if (!(await isInScope(client, messages))) return { reply: REFUSAL, drafts: [], changes: [], refused: true };
+  const inScope = await isInScope(client, messages);
 
   const [accounts, categories] = await Promise.all([listAccounts(db, userId, { archived: false }), listCategories(db, userId)]);
+  if (!inScope) return writeRedirect(client, { messages, language, accounts: accounts.map((a) => a.name), categories: categories.map((c) => c.name) });
   const canary = `ORC-${crypto.randomUUID().slice(0, 8)}`;
   const weekday = new Intl.DateTimeFormat("en-GB", { weekday: "long", timeZone: "UTC" }).format(new Date(`${today}T00:00:00Z`));
   const system = chatSystemPrompt({
@@ -69,17 +73,24 @@ export async function runChat({ client, db, userId, today, messages, language = 
       continue;
     }
 
-    const reply = limitReply(out.content);
-    if (!reply) return { reply: NO_ANSWER, drafts: ctx.drafts, changes: ctx.changes, refused: false };
+    const stripped = stripReasoning(out.content);
+    if (!stripped) return { reply: NO_ANSWER, drafts: ctx.drafts, changes: ctx.changes, refused: false };
     // The internal marker is only ever in the instructions, so seeing it means the instructions are leaking.
-    if (reply.includes(canary) || /ORC-[0-9a-f]{8}/i.test(reply)) return { reply: REFUSAL, drafts: [], changes: [], refused: true };
-
-    // A finance answer is a few plain lines. Code, links and long essays mean the model was talked into something else.
-    if (looksOffTopic(reply)) return { reply: REFUSAL, drafts: [], changes: [], refused: true };
+    // Code, links, tags and tables mean the model was talked into something else. These run before normalization.
+    const rule = rejectRule(stripped, canary);
+    if (rule) {
+      logCheck(`reply-check:${rule}`);
+      return { reply: REDIRECT_FALLBACK, drafts: [], changes: [], refused: true };
+    }
+    const reply = normalizePlainText(stripped);
+    if (!reply) return { reply: NO_ANSWER, drafts: ctx.drafts, changes: ctx.changes, refused: false };
     const bad = ungroundedFigures(reply, allowed);
-    if (bad.length === 0) return { reply, drafts: ctx.drafts, changes: ctx.changes, refused: false };
+    if (bad.length === 0) return { reply: limitReply(reply), drafts: ctx.drafts, changes: ctx.changes, refused: false };
     // Drafts are checked field by field when they are made, so they stay even when the wording of the answer fails.
-    if (corrected) return { reply: GROUNDING_FALLBACK, drafts: ctx.drafts, changes: ctx.changes, refused: false };
+    if (corrected) {
+      logCheck("reply-check:figure");
+      return { reply: GROUNDING_FALLBACK, drafts: ctx.drafts, changes: ctx.changes, refused: false };
+    }
     corrected = true;
     convo.push({ role: "assistant", content: reply });
     convo.push({ role: "user", content: `Notice from the system: your answer contained figures that are not in the data (${bad.slice(0, 4).join("; ")}). Rewrite it using only figures from tool results, use the calculate tool for any arithmetic, or call the tools you need. Do not mention this notice.` });

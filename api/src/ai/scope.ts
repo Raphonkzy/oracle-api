@@ -4,8 +4,8 @@ import { GATE_PROMPT } from "./prompts";
 import { clean } from "./text";
 
 /**
- * The first hard rule: before anything else runs, a separate model call decides whether the person's messages are
- * about their own money in Oracle. It only ever sees the messages as data, and it answers with a fixed JSON.
+ * The first hard rule: before anything else runs, a separate model call decides whether at least one request in the
+ * person's messages is about their own money in Oracle (a mixed message counts as in scope). It only ever sees the messages as data, and it answers with a fixed JSON.
  * It fails closed: if the answer is missing, unreadable, or anything but `true`, the request is out of scope.
  * A provider outage is the one exception, because that is not a verdict. It is reported as unavailable.
  */

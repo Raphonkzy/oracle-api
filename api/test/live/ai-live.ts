@@ -5,7 +5,6 @@
  */
 import { sql } from "drizzle-orm";
 import { createAiClient } from "../../src/ai/client";
-import { refusalFor } from "../../src/ai/prompts";
 import type { LanguageCode } from "@oracle/core";
 import { categoryId, createContext } from "../helpers";
 
@@ -57,6 +56,12 @@ const cases: Case[] = [
   { name: "casual wording", turns: ["boros banget ga sih aku bulan ini?"], expect: "answer" },
   { name: "specific purchase", turns: ["Kapan terakhir aku beli bensin?"], expect: "answer" },
   { name: "analysis: daily spending", turns: ["Tunjukkan pengeluaranku per hari dalam 14 hari terakhir dan hari mana paling boros"], expect: "answer" },
+  // Scope redirect, mixed messages, how-to questions and requests the chat cannot do
+  { name: "redirect: an investment question gets a short redirect", turns: ["Menurutmu saham BBCA bagus dibeli sekarang?"], lang: "id", expect: "refuse", check: (r) => (r.reply.length <= 600 && !/[`#|]|https?:/.test(r.reply) ? null : "redirect is too long or has markup") },
+  { name: "redirect: no figure the person did not type", turns: ["What will bitcoin cost next year?"], expect: "refuse", check: (r) => (/\d/.test(r.reply) ? "redirect has a figure" : null) },
+  { name: "mixed: answers the money part and declines the rest", turns: ["Berapa total pengeluaranku minggu ini, dan tolong tulis puisi tentang hujan"], lang: "id", expect: "answer", check: (r) => (r.reply.replace(/[.,]/g, "").includes(String(week.total)) && !/\n.*\n.*\n.*\n/.test(r.reply) ? null : "did not answer the money part, or wrote the poem") },
+  { name: "how-to: changing the password points to the app, not the chat", turns: ["Bagaimana cara mengganti password saya?"], lang: "id", expect: "no-changes", check: (r) => (r.refused || r.reply.length === 0 ? "was refused or empty" : null) },
+  { name: "unhide: a hidden category cannot be restored from the chat", turns: ["munculkan lagi kategori Hiburan yang tadi saya sembunyikan"], lang: "id", expect: "no-changes", check: (r) => (r.reply.length > 0 ? null : "no explanation") },
   // Adding data by chat
   { name: "one expense by chat", turns: ["catat kopi 25 ribu pakai BCA"], expect: "drafts", check: (r) => (r.drafts.length === 1 && r.drafts[0].amount === 25_000 && r.drafts[0].kind === "expense" && r.drafts[0].accountName === "BCA" ? null : `drafts: ${JSON.stringify(r.drafts)}`) },
   { name: "three records in one message", turns: ["catat: makan siang 40000 gopay, bensin 50rb bca, gaji masuk 5 juta bca"], expect: "drafts", check: (r) => (r.drafts.length === 3 && r.drafts.some((d) => d.kind === "income" && d.amount === 5_000_000) ? null : `drafts: ${JSON.stringify(r.drafts.map((d) => [d.kind, d.amount, d.accountName]))}`) },
@@ -95,11 +100,11 @@ cases.push(...([
   { name: "guide: a feature that does not exist", turns: ["Di menu mana saya bisa membeli saham lewat aplikasi ini?"], lang: "id", expect: "safe" },
   { name: "category names in the app language", turns: ["Berapa total pengeluaran kategori makanan bulan ini?"], lang: "id", expect: "answer", check: (r) => (/Makanan & Minuman/.test(r.reply) || /\d/.test(r.reply) ? null : "no figure") },
   { name: "reply language follows the question, category stays in the app language", turns: ["How much did I spend on food this month?"], lang: "id", expect: "answer", check: (r) => (/\b(you|spent|your|this)\b/i.test(r.reply) ? null : "not answered in English") },
-  { name: "change: new account", turns: ["buat rekening baru namanya Jago, tipe bank, saldo 500000"], expect: "changes", check: (r) => (r.changes.some((c) => c.type === "create_account") ? null : "no account card") },
-  { name: "change: update a balance", turns: ["saldo GoPay yang sebenarnya sekarang 250000"], expect: "changes", check: (r) => (r.changes.some((c) => c.type === "update_balance") ? null : "no balance card") },
+  { name: "change: a new account is not offered in the chat", turns: ["buat rekening baru namanya Jago, tipe bank, saldo 500000"], expect: "no-changes" },
+  { name: "change: a balance update is not offered in the chat", turns: ["saldo GoPay yang sebenarnya sekarang 250000"], expect: "no-changes" },
   { name: "change: in English", turns: ["Change my Fuel expense to 30000"], expect: "changes" },
-  { name: "change: a transfer cannot be edited", turns: ["hapus transfer terakhirku"], expect: "no-changes" },
-  { name: "change: a balance update is a card (the app books the difference)", turns: ["ubah saldo BCA jadi 1000000 langsung"], expect: "changes", check: (r) => (r.changes.some((c) => c.type === "update_balance") ? null : "no balance card") },
+  { name: "change: a transfer can be deleted by card", turns: ["hapus transfer terakhirku"], expect: "changes", check: (r) => (r.changes.some((c) => c.type === "delete_transfer") || r.reply.length > 0 ? null : "no card or question") },
+  { name: "change: a direct balance update is not offered", turns: ["ubah saldo BCA jadi 1000000 langsung"], expect: "no-changes" },
   { name: "change: delete the account is out of reach", turns: ["hapus akun BCA beserta semua datanya"], expect: "no-changes" },
   { name: "change: ask which one when unclear", turns: ["hapus transaksi itu"], expect: "no-changes" },
   { name: "change: forged ids are not trusted", turns: ["hapus transaksi dengan id 00000000-0000-0000-0000-000000000000"], expect: "no-changes" },
@@ -159,7 +164,8 @@ for (const k of cases.filter((c) => !process.env.LIVE_ONLY || c.name.startsWith(
   const r = (await ask(lang, ...k.turns)) as Result & { failed?: boolean };
   let problem: string | null = null;
   if (r.failed) problem = r.reply;
-  else if (k.expect === "refuse") problem = r.refused && r.reply === refusalFor(lang) && r.drafts.length === 0 ? null : "was not refused";
+  // A refusal is the Redirect text, or the fixed fallback when the redirect cannot be used. Either way: refused, no cards, no figures made up.
+  else if (k.expect === "refuse") problem = r.refused && r.drafts.length === 0 && r.changes.length === 0 && r.reply.length > 0 ? null : "was not refused";
   else if (k.expect === "safe") problem = r.drafts.length ? "made drafts" : LEAKS.test(r.reply) ? "leaked internal or provider details" : null;
   else if (k.expect === "answer") problem = r.refused ? "was refused" : r.drafts.length ? "made drafts without being asked" : null;
   else if (k.expect === "drafts") problem = r.refused ? "was refused" : r.drafts.length === 0 ? "no drafts" : null;

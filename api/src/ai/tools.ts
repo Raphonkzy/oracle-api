@@ -1,4 +1,4 @@
-import { ACCOUNT_TYPES, addDays, balanceBreakdown, CATEGORY_ICONS, cycleMonth, isDebtType, isISODate, kindLabel, localCategoryName, lookupGuide, MAX_AMOUNT, AI_MAX_DRAFTS_PER_TURN, TYPE_LABELS, type AccountType, type AiChange, type AiDraft, type AiFieldChange, type AiView, type LanguageCode, type Period } from "@oracle/core";
+import { addDays, balanceBreakdown, CATEGORY_ICONS, cycleMonth, isFeeCategory, isISODate, kindLabel, LANGUAGE_CODES, localCategoryName, lookupGuide, MAX_AMOUNT, AI_MAX_DRAFTS_PER_TURN, THEMES, type AiChange, type AiDraft, type AiFieldChange, type AiView, type LanguageCode, type Period } from "@oracle/core";
 import type { Db } from "@oracle/db/client";
 import { sql } from "drizzle-orm";
 import { z } from "zod";
@@ -8,7 +8,7 @@ import { listCategories } from "../services/catalog";
 import { getInsights, getStatsCategories, getStatsDetails, getStatsFlow, getStatsTrend } from "../services/stats";
 import { getCycleStart } from "../services/settings";
 import { getSummary } from "../services/summary";
-import { getTransaction, listTransactions } from "../services/transactions";
+import { getTransaction, getTransfer, listTransactions } from "../services/transactions";
 import type { ToolSpec } from "./client";
 import { clean, safeLabel } from "./text";
 
@@ -164,7 +164,7 @@ async function resolveAccountId(ctx: ToolContext, name: string): Promise<{ id: s
 const searchTransactions: Tool = {
   spec: fn(
     "search_transactions",
-    "Find individual transactions, newest first. Use for questions about specific purchases, and to get the id of a transaction before proposing a change to it. At most 30 are returned.",
+    "Find individual transactions, newest first. Use for questions about specific purchases, and to get the id of a transaction before proposing a change to it. Rows with transferLeg true are parts of a transfer: use edit_transfer or delete_transfer for them. At most 30 are returned.",
     {
       query: { type: "string", description: "Words in the description, note, category or account name" },
       account: { type: "string", description: "Account name" },
@@ -187,7 +187,7 @@ const searchTransactions: Tool = {
       note: NOTE,
       count: page.items.length,
       more: page.nextCursor !== null,
-      transactions: page.items.map((r) => ({ id: r.id, editable: (r.kind === "income" || r.kind === "expense") && r.transferId === null, date: r.date, type: kindLabel(r), amount: r.amount, account: safeLabel(r.accountName), category: r.categoryName ? catLabel(ctx, r.categoryName) : null, description: r.description ? clean(r.description) : null, note: r.note ? clean(r.note) : null, otherAccount: r.counterpartName ? safeLabel(r.counterpartName) : null })),
+      transactions: page.items.map((r) => ({ id: r.id, editable: (r.kind === "income" || r.kind === "expense") && r.transferId === null, transferLeg: r.transferId !== null, date: r.date, type: kindLabel(r), amount: r.amount, account: safeLabel(r.accountName), category: r.categoryName ? catLabel(ctx, r.categoryName) : null, description: r.description ? clean(r.description) : null, note: r.note ? clean(r.note) : null, otherAccount: r.counterpartName ? safeLabel(r.counterpartName) : null })),
     };
   },
 };
@@ -314,7 +314,7 @@ const proposeTransactions: Tool = {
     const latest = addDays(ctx.today, 366);
 
     parsed.data.items.forEach((raw, index) => {
-      if (ctx.drafts.length >= AI_MAX_DRAFTS_PER_TURN) return void errors.push({ index, message: `At most ${AI_MAX_DRAFTS_PER_TURN} drafts at a time.` });
+      if (ctx.drafts.length + ctx.changes.length >= AI_MAX_DRAFTS_PER_TURN) return void errors.push({ index, message: `At most ${AI_MAX_DRAFTS_PER_TURN} drafts at a time.` });
       const item = draftItem.safeParse(raw);
       if (!item.success) return void errors.push({ index, message: item.error.issues[0]?.message ?? "Invalid record." });
       const d = item.data;
@@ -363,25 +363,31 @@ const proposeTransactions: Tool = {
 };
 
 
+const ACTIONS = ["edit_transaction", "delete_transaction", "edit_transfer", "delete_transfer", "set_budget", "create_category", "rename_category", "hide_category", "set_cycle_start", "set_theme", "set_language"] as const;
+
 const changeItem = z.object({
-  action: z.enum(["edit_transaction", "delete_transaction", "set_budget", "create_category", "create_account", "rename_account", "update_balance"]),
-  account_type: z.enum(ACCOUNT_TYPES).optional(),
+  action: z.enum(ACTIONS),
   transaction_id: z.string().uuid().optional(),
   amount: z.number().int().min(0).max(MAX_AMOUNT).optional(),
+  fee: z.number().int().min(0).max(MAX_AMOUNT).optional(),
   date: day.optional(),
   description: z.string().max(120).optional(),
   category: z.string().max(80).optional(),
   account: z.string().max(80).optional(),
+  to_account: z.string().max(80).optional(),
   month: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/, { error: "month must look like 2026-11." }).optional(),
   name: z.string().trim().min(1).max(40).optional(),
   kind: z.enum(["income", "expense"]).optional(),
   icon: z.string().max(40).optional(),
+  day: z.number().int().min(1).max(28).optional(),
+  theme: z.enum(THEMES).optional(),
+  language: z.enum(LANGUAGE_CODES).optional(),
 });
 
 const proposeChanges: Tool = {
   spec: fn(
     "propose_changes",
-    "Propose a change to the person's existing data for them to confirm. NOTHING IS CHANGED: this only creates cards in the app. Actions: edit_transaction (needs transaction_id from search_transactions, plus any of amount, date, description, category, account to change), delete_transaction (needs transaction_id), set_budget (category and amount; amount 0 removes the budget; optional month YYYY-MM), create_category (name and kind income or expense; optional icon). create_account (name, account_type, optional amount = what it holds now; for paylater and credit_card the amount is what is owed), rename_account (account = current name, name = new name), update_balance (account and amount = the real balance now, so the app books the difference; for a bill the amount owed). To move many transactions to another category, make one edit_transaction per transaction. Transfers cannot be changed here. Budgets and categories are matched by the names the person sees.",
+    "Propose a change to the person's existing data or settings for them to confirm. NOTHING IS CHANGED: this only creates cards in the app. Actions: edit_transaction (needs transaction_id from search_transactions, plus any of amount, date, description, category, account to change; income and expense rows only), delete_transaction (needs transaction_id), edit_transfer (transaction_id of any leg or fee row of the transfer, plus any of amount, date, description, fee, account = the sending account, to_account), delete_transfer (transaction_id of any leg; deletes both sides and the fee), set_budget (category and amount; amount 0 removes the budget; optional month YYYY-MM; expense categories only), create_category (name and kind income or expense; optional icon), rename_category (category = current name, name = new name, optional kind), hide_category (category, optional kind), set_cycle_start (day 1 to 28: the day the person's month starts), set_theme (theme), set_language (language). To move many transactions to another category, make one edit_transaction per transaction. Accounts cannot be created, renamed or have their balance changed here. Categories cannot be unhidden. Budgets and categories are matched by the names the person sees.",
     {
       changes: {
         type: "array",
@@ -389,18 +395,22 @@ const proposeChanges: Tool = {
         items: {
           type: "object",
           properties: {
-            action: { type: "string", enum: ["edit_transaction", "delete_transaction", "set_budget", "create_category", "create_account", "rename_account", "update_balance"] },
-            account_type: { type: "string", enum: [...ACCOUNT_TYPES], description: "create_account: bank, ewallet, emoney, paylater, credit_card, investment, cash or other" },
-            transaction_id: { type: "string", description: "The id from search_transactions" },
-            amount: { type: "integer", description: "Whole rupiah. For edit_transaction the new amount (positive). For set_budget the limit, 0 to remove it. For create_account what it holds (or owes). For update_balance the real balance now." },
-            date: { type: "string", description: "edit_transaction: the new date, YYYY-MM-DD" },
-            description: { type: "string", description: "edit_transaction: the new description" },
-            category: { type: "string", description: "edit_transaction: the new category name. set_budget: the category of the budget." },
-            account: { type: "string", description: "edit_transaction: move it to this account (name). rename_account and update_balance: the account." },
+            action: { type: "string", enum: [...ACTIONS] },
+            transaction_id: { type: "string", description: "The id from search_transactions. For edit_transfer and delete_transfer, the id of any leg or the fee row." },
+            amount: { type: "integer", description: "Whole rupiah. For edit_transaction and edit_transfer the new amount (positive). For set_budget the limit, 0 to remove it." },
+            fee: { type: "integer", description: "edit_transfer: the new admin fee, 0 removes it" },
+            date: { type: "string", description: "edit_transaction, edit_transfer: the new date, YYYY-MM-DD" },
+            description: { type: "string", description: "edit_transaction, edit_transfer: the new description" },
+            category: { type: "string", description: "edit_transaction: the new category name. set_budget: the category of the budget. rename_category, hide_category: the category." },
+            account: { type: "string", description: "edit_transaction: move it to this account (name). edit_transfer: the new sending account." },
+            to_account: { type: "string", description: "edit_transfer: the new receiving account" },
             month: { type: "string", description: "set_budget: YYYY-MM. Defaults to the current month." },
-            name: { type: "string", description: "create_category, create_account: the new name. rename_account: the new name of the account." },
-            kind: { type: "string", enum: ["income", "expense"], description: "create_category: income or expense" },
+            name: { type: "string", description: "create_category: the new name. rename_category: the new name of the category." },
+            kind: { type: "string", enum: ["income", "expense"], description: "create_category: income or expense. rename_category, hide_category: to choose between two categories with the same name." },
             icon: { type: "string", description: "create_category: an icon name, optional" },
+            day: { type: "integer", description: "set_cycle_start: 1 to 28" },
+            theme: { type: "string", enum: [...THEMES], description: "set_theme" },
+            language: { type: "string", enum: [...LANGUAGE_CODES], description: "set_language" },
           },
           required: ["action"],
         },
@@ -419,6 +429,8 @@ const proposeChanges: Tool = {
     const earliest = addDays(ctx.today, -366 * 3);
     const latest = addDays(ctx.today, 366);
     const unknownAmount = (n: number) => n !== 0 && ctx.userWroteDigits && !ctx.known.has(n);
+    const unknownMsg = (label: string, n: number) => `The ${label} ${n} is not a number the person wrote or one from their data. Ask them for the ${label}.`;
+    const accountError = (name: string) => `No account called "${clean(name, 40)}". The accounts are: ${accounts.map((a) => safeLabel(a.name)).join(", ") || "none"}.`;
 
     for (const [index, raw] of parsed.data.changes.entries()) {
       const fail = (message: string) => void errors.push({ index, message });
@@ -432,6 +444,10 @@ const proposeChanges: Tool = {
         continue;
       }
       const c = item.data;
+      const push = (change: AiChange, summary: Record<string, unknown>) => {
+        ctx.changes.push(change);
+        proposed.push({ id: change.id, action: c.action, ...summary });
+      };
 
       if (c.action === "edit_transaction" || c.action === "delete_transaction") {
         if (!c.transaction_id) {
@@ -449,17 +465,19 @@ const proposeChanges: Tool = {
           fail("No transaction with that id. Use search_transactions to find the right one.");
           continue;
         }
-        if ((row.kind !== "income" && row.kind !== "expense") || row.transferId !== null) {
-          fail("Transfers, transfer fees and balance updates cannot be changed from here. Tell the person to open it in the app.");
+        if (row.transferId !== null) {
+          fail("That row is part of a transfer. Use edit_transfer or delete_transfer with the same id.");
+          continue;
+        }
+        if (row.kind !== "income" && row.kind !== "expense") {
+          fail("Balance updates cannot be changed from here. Tell the person to open it in the app.");
           continue;
         }
         const title = safeLabel(row.description || row.categoryName || kindLabel(row));
         const base = { transactionId: row.id, title, date: row.date, amount: Math.abs(row.amount), kind: row.kind, accountName: safeLabel(row.accountName) };
         if (c.action === "delete_transaction") {
           touched.add(key);
-          const change: AiChange = { id: crypto.randomUUID(), type: "delete_transaction", ...base };
-          ctx.changes.push(change);
-          proposed.push({ id: change.id, action: "delete_transaction", ...base });
+          push({ id: crypto.randomUUID(), type: "delete_transaction", ...base }, base);
           continue;
         }
         const fields: AiFieldChange[] = [];
@@ -470,7 +488,7 @@ const proposeChanges: Tool = {
             continue;
           }
           if (unknownAmount(c.amount)) {
-            fail(`The amount ${c.amount} is not a number the person wrote or one from their data. Ask them for the amount.`);
+            fail(unknownMsg("amount", c.amount));
             continue;
           }
           if (c.amount !== Math.abs(row.amount)) {
@@ -507,7 +525,7 @@ const proposeChanges: Tool = {
         if (c.account !== undefined) {
           const found = matchByName(accounts, c.account);
           if (found.kind !== "one") {
-            fail(found.kind === "many" ? `More than one account matches "${clean(c.account, 40)}": ${found.options.join(", ")}. Ask which one.` : `No account called "${clean(c.account, 40)}". The accounts are: ${accounts.map((a) => safeLabel(a.name)).join(", ") || "none"}.`);
+            fail(found.kind === "many" ? `More than one account matches "${clean(c.account, 40)}": ${found.options.join(", ")}. Ask which one.` : accountError(c.account));
             continue;
           }
           if (found.item.id !== row.accountId) {
@@ -520,9 +538,116 @@ const proposeChanges: Tool = {
           continue;
         }
         touched.add(key);
-        const change: AiChange = { id: crypto.randomUUID(), type: "edit_transaction", ...base, fields, patch };
-        ctx.changes.push(change);
-        proposed.push({ id: change.id, action: "edit_transaction", ...base, changes: fields });
+        push({ id: crypto.randomUUID(), type: "edit_transaction", ...base, fields, patch }, { ...base, changes: fields });
+        continue;
+      }
+
+      if (c.action === "edit_transfer" || c.action === "delete_transfer") {
+        if (!c.transaction_id) {
+          fail("transaction_id is required. Get it from search_transactions.");
+          continue;
+        }
+        const row = await getTransaction(ctx.db, ctx.userId, c.transaction_id).catch(() => null);
+        if (!row) {
+          fail("No transaction with that id. Use search_transactions to find the right one.");
+          continue;
+        }
+        if (row.transferId === null) {
+          fail("That row is not part of a transfer. Use edit_transaction or delete_transaction.");
+          continue;
+        }
+        const key = `transfer:${row.transferId}`;
+        if (touched.has(key)) {
+          fail("That transfer already has a proposal in this answer.");
+          continue;
+        }
+        const tr = await getTransfer(ctx.db, ctx.userId, row.transferId);
+        if (!tr) {
+          fail("No transfer found for that id.");
+          continue;
+        }
+        const base = { transferId: tr.id, date: tr.date, amount: tr.amount, fee: tr.fee, fromAccountName: safeLabel(tr.fromAccountName), toAccountName: safeLabel(tr.toAccountName), note: tr.note ? clean(tr.note, 120) : null };
+        if (c.action === "delete_transfer") {
+          touched.add(key);
+          push({ id: crypto.randomUUID(), type: "delete_transfer", ...base }, base);
+          continue;
+        }
+        const fields: AiFieldChange[] = [];
+        const patch: Extract<AiChange, { type: "edit_transfer" }>["patch"] = {};
+        if (c.amount !== undefined) {
+          if (c.amount <= 0) {
+            fail("The new amount must be more than zero.");
+            continue;
+          }
+          if (unknownAmount(c.amount)) {
+            fail(unknownMsg("amount", c.amount));
+            continue;
+          }
+          if (c.amount !== tr.amount) {
+            fields.push({ field: "amount", from: tr.amount, to: c.amount });
+            patch.amount = c.amount;
+          }
+        }
+        if (c.fee !== undefined) {
+          if (unknownAmount(c.fee)) {
+            fail(unknownMsg("fee", c.fee));
+            continue;
+          }
+          if (c.fee !== tr.fee) {
+            fields.push({ field: "fee", from: tr.fee, to: c.fee });
+            patch.fee = c.fee;
+          }
+        }
+        if (c.date !== undefined && c.date !== tr.date) {
+          if (c.date < earliest || c.date > latest) {
+            fail("That date is too far from today. Ask the person for the right date.");
+            continue;
+          }
+          fields.push({ field: "date", from: tr.date, to: c.date });
+          patch.date = c.date;
+        }
+        if (c.description !== undefined) {
+          const next = c.description.trim() ? clean(c.description, 120) : null;
+          if (next !== (tr.note ?? null)) {
+            fields.push({ field: "description", from: tr.note ? clean(tr.note, 120) : null, to: next });
+            patch.note = next;
+          }
+        }
+        let fromId = tr.fromAccountId;
+        let toId = tr.toAccountId;
+        let sideError: string | null = null;
+        for (const [side, wanted] of [["from", c.account], ["to", c.to_account]] as const) {
+          if (wanted === undefined) continue;
+          const found = matchByName(accounts, wanted);
+          if (found.kind !== "one") {
+            sideError = found.kind === "many" ? `More than one account matches "${clean(wanted, 40)}": ${found.options.join(", ")}. Ask which one.` : accountError(wanted);
+            break;
+          }
+          if (side === "from" && found.item.id !== tr.fromAccountId) {
+            fromId = found.item.id;
+            patch.fromAccountId = found.item.id;
+            fields.push({ field: "from_account", from: safeLabel(tr.fromAccountName), to: safeLabel(found.item.name) });
+          }
+          if (side === "to" && found.item.id !== tr.toAccountId) {
+            toId = found.item.id;
+            patch.toAccountId = found.item.id;
+            fields.push({ field: "to_account", from: safeLabel(tr.toAccountName), to: safeLabel(found.item.name) });
+          }
+        }
+        if (sideError) {
+          fail(sideError);
+          continue;
+        }
+        if (fromId === toId) {
+          fail("A transfer needs two different accounts.");
+          continue;
+        }
+        if (fields.length === 0) {
+          fail("Nothing would change. Either no field was given or it already has that value.");
+          continue;
+        }
+        touched.add(key);
+        push({ id: crypto.randomUUID(), type: "edit_transfer", ...base, fields, patch }, { ...base, changes: fields });
         continue;
       }
 
@@ -537,7 +662,7 @@ const proposeChanges: Tool = {
           continue;
         }
         if (unknownAmount(c.amount)) {
-          fail(`The amount ${c.amount} is not a number the person wrote or one from their data. Ask them for the amount.`);
+          fail(unknownMsg("amount", c.amount));
           continue;
         }
         const month = c.month ?? cycleMonth(ctx.today, await getCycleStart(ctx.db, ctx.userId));
@@ -552,85 +677,92 @@ const proposeChanges: Tool = {
           continue;
         }
         touched.add(key);
-        const change: AiChange = { id: crypto.randomUUID(), type: "set_budget", month, categoryId: found.item.id, categoryName: safeLabel(found.item.name), from: current, to: c.amount };
-        ctx.changes.push(change);
-        proposed.push({ id: change.id, action: "set_budget", month, category: change.categoryName, from: current, to: c.amount });
+        const categoryName = safeLabel(found.item.name);
+        push({ id: crypto.randomUUID(), type: "set_budget", month, categoryId: found.item.id, categoryName, from: current, to: c.amount }, { month, category: categoryName, from: current, to: c.amount });
         continue;
       }
 
-      if (c.action === "create_account" || c.action === "rename_account" || c.action === "update_balance") {
-        if (c.action === "create_account") {
-          if (!c.name || !c.account_type) {
-            fail("create_account needs a name and an account_type.");
-            continue;
-          }
-          const name = clean(c.name, 40);
-          const amount = c.amount ?? 0;
-          if (unknownAmount(amount)) {
-            fail(`The amount ${amount} is not a number the person wrote or one from their data. Ask them for the amount.`);
-            continue;
-          }
-          const key = `account:${name.toLowerCase()}`;
-          if (touched.has(key) || accounts.some((a) => a.name.trim().toLowerCase() === name.toLowerCase())) {
-            fail(`There is already an account called "${name}". Ask for a different name.`);
-            continue;
-          }
-          touched.add(key);
-          const type: AccountType = c.account_type;
-          const change: AiChange = { id: crypto.randomUUID(), type: "create_account", name, accountType: type, initialBalance: isDebtType(type) ? -amount : amount, date: ctx.today };
-          ctx.changes.push(change);
-          proposed.push({ id: change.id, action: "create_account", name, accountType: TYPE_LABELS[type], amount, isBill: isDebtType(type) });
+      if (c.action === "rename_category" || c.action === "hide_category") {
+        if (!c.category) {
+          fail(`${c.action} needs the category.`);
           continue;
         }
-        const found = matchByName(accounts, c.account ?? "");
+        const pool = c.kind ? categories.filter((k) => k.kind === c.kind) : categories;
+        const found = matchByName(pool, c.category);
         if (found.kind !== "one") {
-          fail(found.kind === "many" ? `More than one account matches "${clean(c.account ?? "", 40)}": ${found.options.join(", ")}. Ask which one.` : `No account called "${clean(c.account ?? "", 40)}". The accounts are: ${accounts.map((a) => safeLabel(a.name)).join(", ") || "none"}.`);
+          fail(found.kind === "many" ? `More than one category matches "${clean(c.category, 40)}": ${found.options.join(", ")}. Ask which one (expense or income), and pass kind.` : `No category called "${clean(c.category, 40)}".`);
           continue;
         }
-        const key = `account:${found.item.id}`;
+        const cat = found.item;
+        if (cat.kind === "expense" && isFeeCategory(cat.alt)) {
+          fail("The fees category cannot be renamed or hidden.");
+          continue;
+        }
+        const key = `category-id:${cat.id}`;
         if (touched.has(key)) {
-          fail("That account already has a proposal in this answer.");
+          fail("That category already has a proposal in this answer.");
           continue;
         }
-        if (c.action === "rename_account") {
-          const next = c.name ? clean(c.name, 40) : "";
-          if (!next) {
-            fail("rename_account needs the new name.");
-            continue;
-          }
-          if (next === found.item.name) {
-            fail("The account already has that name.");
-            continue;
-          }
-          if (accounts.some((a) => a.id !== found.item.id && a.name.trim().toLowerCase() === next.toLowerCase())) {
-            fail(`There is already an account called "${next}".`);
-            continue;
-          }
+        if (c.action === "hide_category") {
           touched.add(key);
-          const change: AiChange = { id: crypto.randomUUID(), type: "rename_account", accountId: found.item.id, from: safeLabel(found.item.name), to: next };
-          ctx.changes.push(change);
-          proposed.push({ id: change.id, action: "rename_account", from: change.from, to: next });
+          const name = safeLabel(cat.name);
+          push({ id: crypto.randomUUID(), type: "hide_category", categoryId: cat.id, kind: cat.kind, name }, { name, kind: cat.kind, note: "Past transactions keep it. Its budgets are removed." });
           continue;
         }
-        // update_balance
-        if (c.amount === undefined) {
-          fail("update_balance needs the real balance as amount.");
+        const next = c.name ? clean(c.name, 40) : "";
+        if (!next) {
+          fail("rename_category needs the new name.");
           continue;
         }
-        if (unknownAmount(c.amount)) {
-          fail(`The amount ${c.amount} is not a number the person wrote or one from their data. Ask them for the amount.`);
+        const lower = next.toLowerCase();
+        if (cat.name.trim().toLowerCase() === lower || cat.alt.trim().toLowerCase() === lower) {
+          fail("The category already has that name.");
           continue;
         }
-        const bill = isDebtType(found.item.type);
-        const to = bill ? -c.amount : c.amount;
-        if (to === found.item.balance) {
-          fail("The account already has that balance.");
+        if (touched.has(`category:${cat.kind}:${lower}`) || categories.some((k) => k.id !== cat.id && k.kind === cat.kind && [k.name, k.alt].some((n) => n.trim().toLowerCase() === lower))) {
+          fail(`There is already a ${cat.kind} category called "${next}".`);
           continue;
         }
         touched.add(key);
-        const change: AiChange = { id: crypto.randomUUID(), type: "update_balance", accountId: found.item.id, accountName: safeLabel(found.item.name), from: found.item.balance, to, date: ctx.today };
-        ctx.changes.push(change);
-        proposed.push({ id: change.id, action: "update_balance", account: change.accountName, isBill: bill, balanceNow: Math.abs(found.item.balance), balanceAfter: c.amount, note: "A balance update books the difference as an adjustment." });
+        touched.add(`category:${cat.kind}:${lower}`);
+        const from = safeLabel(cat.name);
+        push({ id: crypto.randomUUID(), type: "rename_category", categoryId: cat.id, kind: cat.kind, from, to: next }, { kind: cat.kind, from, to: next });
+        continue;
+      }
+
+      if (c.action === "set_cycle_start") {
+        if (c.day === undefined) {
+          fail("set_cycle_start needs day, a whole number from 1 to 28.");
+          continue;
+        }
+        const current = await getCycleStart(ctx.db, ctx.userId);
+        if (c.day === current) {
+          fail("The month already starts on that day.");
+          continue;
+        }
+        if (touched.has("cycle")) {
+          fail("The month start already has a proposal in this answer.");
+          continue;
+        }
+        touched.add("cycle");
+        push({ id: crypto.randomUUID(), type: "set_cycle_start", from: current, to: c.day }, { from: current, to: c.day });
+        continue;
+      }
+
+      if (c.action === "set_theme" || c.action === "set_language") {
+        const value = c.action === "set_theme" ? c.theme : c.language;
+        if (!value) {
+          fail(c.action === "set_theme" ? `set_theme needs theme: ${THEMES.join(", ")}.` : `set_language needs language: ${LANGUAGE_CODES.join(", ")}.`);
+          continue;
+        }
+        if (touched.has(c.action)) {
+          fail("That setting already has a proposal in this answer.");
+          continue;
+        }
+        touched.add(c.action);
+        // The app compares with the current value, because only the phone knows it.
+        if (c.action === "set_theme" && c.theme) push({ id: crypto.randomUUID(), type: "set_theme", to: c.theme }, { to: c.theme });
+        else if (c.action === "set_language" && c.language) push({ id: crypto.randomUUID(), type: "set_language", to: c.language }, { to: c.language });
         continue;
       }
 
@@ -647,9 +779,7 @@ const proposeChanges: Tool = {
       }
       touched.add(key);
       const icon = (CATEGORY_ICONS as readonly string[]).includes(c.icon ?? "") ? (c.icon as string) : "tag";
-      const change: AiChange = { id: crypto.randomUUID(), type: "create_category", name, kind: c.kind, icon };
-      ctx.changes.push(change);
-      proposed.push({ id: change.id, action: "create_category", name, kind: c.kind });
+      push({ id: crypto.randomUUID(), type: "create_category", name, kind: c.kind, icon }, { name, kind: c.kind });
     }
     return { saved: false, note: "These are proposals only. The person must confirm each one in the app. Do not say anything was changed, deleted or saved.", proposed, errors };
   },

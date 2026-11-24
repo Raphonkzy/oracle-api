@@ -6,16 +6,13 @@ import { runTool, type ToolContext } from "../src/ai/tools";
 import { chatSystemPrompt } from "../src/ai/prompts";
 import { balanceOf, categoryId, createContext, type Client, type TestContext } from "./helpers";
 
-type Proposal = { saved: boolean; proposed: Record<string, unknown>[]; errors: { index: number; message: string }[] };
-
-describe("the assistant knows the app, speaks the app's category names and manages accounts", () => {
+describe("the assistant knows the app and speaks the app's category names", () => {
   let ctx: TestContext;
   let me: Client;
   let userId: string;
   let bca: string;
   const context = (over: Partial<ToolContext> = {}): ToolContext => ({ db: ctx.db, userId, today: "2026-11-19", language: "id", drafts: [], changes: [], known: new Set<number>(), userWroteDigits: false, ...over });
   const run = async (c: ToolContext, tool: string, args: unknown) => (await runTool(c, tool, JSON.stringify(args))) as Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
-  const accountsCount = async () => Number(((await ctx.db.execute(sql`select count(*) as n from money_accounts`)) as unknown as { n: string }[])[0].n);
 
   before(async () => {
     ctx = await createContext({ now: "2026-11-19T05:00:00Z" });
@@ -92,50 +89,17 @@ describe("the assistant knows the app, speaks the app's category names and manag
     });
   });
 
-  describe("accounts by chat", () => {
-    it("a new account is a card, and nothing is created", async () => {
-      const c = context({ userWroteDigits: true, known: new Set([500_000]) });
-      const n = await accountsCount();
-      const res = (await run(c, "propose_changes", { changes: [{ action: "create_account", name: "Jago", account_type: "bank", amount: 500_000 }] })) as unknown as Proposal;
-      assert.deepEqual(res.errors, []);
-      assert.equal(res.saved, false);
-      assert.equal(c.changes[0].type, "create_account");
-      assert.equal(await accountsCount(), n);
-      if (c.changes[0].type === "create_account") assert.deepEqual([c.changes[0].initialBalance, c.changes[0].accountType], [500_000, "bank"]);
-    });
-
-    it("a paylater account is stored as money owed", async () => {
-      const c = context({ userWroteDigits: true, known: new Set([300_000]) });
-      await run(c, "propose_changes", { changes: [{ action: "create_account", name: "Kredivo", account_type: "paylater", amount: 300_000 }] });
-      const ch = c.changes[0];
-      assert.equal(ch.type === "create_account" && ch.initialBalance, -300_000);
-    });
-
-    it("refuses a name that already exists and an amount the person did not write", async () => {
-      const dup = context();
-      const r1 = (await run(dup, "propose_changes", { changes: [{ action: "create_account", name: "bca", account_type: "bank" }] })) as unknown as Proposal;
-      assert.match(r1.errors[0].message, /already an account/);
-      const made = context({ userWroteDigits: true, known: new Set([1]) });
-      const r2 = (await run(made, "propose_changes", { changes: [{ action: "create_account", name: "Jago", account_type: "bank", amount: 999_000 }] })) as unknown as Proposal;
-      assert.match(r2.errors[0].message, /not a number the person wrote/);
-      assert.equal(made.changes.length, 0);
-    });
-
-    it("renaming and updating a balance are cards with before and after", async () => {
-      const c = context({ userWroteDigits: true, known: new Set([900_000]) });
-      const res = (await run(c, "propose_changes", { changes: [{ action: "rename_account", account: "BCA", name: "BCA Utama" }, { action: "update_balance", account: "SPayLater", amount: 900_000 }] })) as unknown as Proposal;
-      assert.deepEqual(res.errors, []);
-      const [rename, balance] = c.changes;
-      assert.equal(rename.type === "rename_account" && `${rename.from}>${rename.to}`, "BCA>BCA Utama");
-      if (balance.type !== "update_balance") throw new Error("expected a balance update");
-      assert.deepEqual([balance.from, balance.to], [-200_000, -900_000], "the bill is owed, so it is stored negative");
-      assert.equal(await balanceOf(me, bca), 950_000, "nothing changed");
-    });
-
-    it("a balance update to the balance it already has changes nothing", async () => {
-      const c = context({ userWroteDigits: true, known: new Set([950_000]) });
-      const res = (await run(c, "propose_changes", { changes: [{ action: "update_balance", account: "BCA", amount: 950_000 }] })) as unknown as Proposal;
-      assert.match(res.errors[0].message, /already has that balance/);
+  describe("account endpoints", () => {
+    it("search_transactions marks a transfer leg and does not offer it for editing", async () => {
+      const gopay = (await me.post("/api/v1/accounts", { providerId: null, name: "GoPay", type: "ewallet", initialBalance: 0, initialBalanceDate: "2026-11-01", includeInTotal: true })).body.account.id as string;
+      const made = await me.post("/api/v1/transfers", { fromAccountId: bca, toAccountId: gopay, amount: 30_000, fee: 0, date: "2026-11-18" });
+      assert.equal(made.status, 201, JSON.stringify(made.body));
+      const found = await run(context(), "search_transactions", { from: "2026-11-18", to: "2026-11-18" });
+      const legs = (found.transactions as { editable: boolean; transferLeg: boolean; amount: number }[]).filter((t) => t.transferLeg);
+      assert.ok(legs.length >= 2, "both legs are listed");
+      assert.ok(legs.every((t) => t.editable === false));
+      const plain = (found.transactions as { editable: boolean; transferLeg: boolean }[]).filter((t) => !t.transferLeg);
+      assert.ok(plain.every((t) => t.editable === true));
     });
 
     it("the card, once confirmed in the app, goes through the ordinary endpoints with their checks", async () => {
