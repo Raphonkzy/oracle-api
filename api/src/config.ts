@@ -16,6 +16,8 @@ const schema = z.object({
   AI_BASE_URL: z.string().default(""),
   AI_API_KEY: z.string().default(""),
   AI_MODEL: z.string().default("deepseek-v4.1-flash"),
+  /** Sent to the provider as reasoning_effort. The default "none" turns off the model's thinking. Empty means the field is not sent. */
+  AI_REASONING_EFFORT: z.string().default("none"),
   /** Assistant calls (chat and summary) each person may make an hour. */
   AI_RATE_PER_HOUR: z.coerce.number().int().min(1).max(1000).default(40),
   /** Outgoing email, used for the password reset code. Leave SMTP_HOST empty to switch "Forgot password" off. */
@@ -45,6 +47,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
     corsOrigins: c.CORS_ORIGINS.split(",").map((s) => s.trim()).filter(Boolean),
     runMigrations: c.RUN_MIGRATIONS === "true",
     ai: c.AI_API_KEY.trim() && c.AI_BASE_URL.trim() ? { baseUrl: c.AI_BASE_URL.trim(), apiKey: c.AI_API_KEY.trim(), model: c.AI_MODEL.trim() } : null,
+    aiReasoningEffort: c.AI_REASONING_EFFORT.trim(),
     aiPerHour: c.AI_RATE_PER_HOUR,
     smtp: c.SMTP_HOST.trim() && c.SMTP_FROM.trim() ? { host: c.SMTP_HOST.trim(), port: c.SMTP_PORT, secure: c.SMTP_SECURE ? c.SMTP_SECURE === "true" : c.SMTP_PORT === 465, user: c.SMTP_USER.trim(), password: c.SMTP_PASSWORD, from: c.SMTP_FROM.trim() } : null,
   };

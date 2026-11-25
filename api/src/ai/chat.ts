@@ -2,7 +2,7 @@ import { collectAllowed, localCategoryName, parseUserAmounts, ungroundedFigures,
 import type { Db } from "@oracle/db/client";
 import { listAccounts } from "../services/accounts";
 import { listCategories } from "../services/catalog";
-import type { AiClient, ChatMessage } from "./client";
+import type { AiClient, ChatMessage, ToolCall } from "./client";
 import { chatSystemPrompt, groundingFallbackFor, noAnswerFor, redirectFallbackFor } from "./prompts";
 import { logCheck, normalizePlainText, rejectRule, stripReasoning } from "./checks";
 import { writeRedirect } from "./redirect";
@@ -14,6 +14,8 @@ import { TOOL_SPECS, runTool, type ToolContext } from "./tools";
 const MAX_STEPS = 6;
 const MAX_CALLS_PER_STEP = 4;
 const MAX_TOOL_RESULT_CHARS = 14_000;
+/** The tools that only create cards. They run one at a time, in the order the model asked. */
+const PROPOSE_TOOLS = new Set(["propose_transactions", "propose_changes"]);
 
 
 type Deps = { client: AiClient; db: Db; userId: string; today: string; messages: AiMessage[]; language?: LanguageCode; view?: AiView };
@@ -30,9 +32,11 @@ export async function runChat({ client, db, userId, today, messages, language = 
   const REDIRECT_FALLBACK = redirectFallbackFor(language);
   const NO_ANSWER = noAnswerFor(language);
   const GROUNDING_FALLBACK = groundingFallbackFor(language);
-  const inScope = await isInScope(client, messages);
-
-  const [accounts, categories] = await Promise.all([listAccounts(db, userId, { archived: false }), listCategories(db, userId)]);
+  // The gate and the account and category reads do not depend on each other, so they run together.
+  const [inScope, [accounts, categories]] = await Promise.all([
+    isInScope(client, messages),
+    Promise.all([listAccounts(db, userId, { archived: false }), listCategories(db, userId)]),
+  ]);
   if (!inScope) return writeRedirect(client, { messages, language, accounts: accounts.map((a) => a.name), categories: categories.map((c) => c.name) });
   const canary = `ORC-${crypto.randomUUID().slice(0, 8)}`;
   const weekday = new Intl.DateTimeFormat("en-GB", { weekday: "long", timeZone: "UTC" }).format(new Date(`${today}T00:00:00Z`));
@@ -58,13 +62,20 @@ export async function runChat({ client, db, userId, today, messages, language = 
 
   let corrected = false;
   for (let step = 0; step < MAX_STEPS; step += 1) {
-    const out = await client.complete({ messages: convo, tools: TOOL_SPECS, maxTokens: 2000, temperature: 0.2 });
+    // After a figure notice the model rewrites its answer. That call keeps the request it had before the reasoning setting existed.
+    const out = await client.complete({ messages: convo, tools: TOOL_SPECS, maxTokens: 2000, temperature: 0.2, ...(corrected ? { reasoningEffort: null } : {}) });
 
     if (out.toolCalls.length > 0) {
       convo.push({ role: "assistant", content: out.content, tool_calls: out.toolCalls });
+      const runAt = (i: number, call: ToolCall) => (i < MAX_CALLS_PER_STEP ? runTool(ctx, call.function.name, call.function.arguments) : Promise.resolve({ error: "Too many tool calls at once. Ask for fewer." }));
+      // Read-only calls in one round run together. Proposals run one by one, because they append to the shared
+      // drafts and changes, and the caps depend on that order.
+      const readOnly = out.toolCalls.every((call) => !PROPOSE_TOOLS.has(call.function.name));
+      const results: unknown[] = [];
+      if (readOnly) results.push(...(await Promise.all(out.toolCalls.map((call, i) => runAt(i, call)))));
+      else for (const [i, call] of out.toolCalls.entries()) results.push(await runAt(i, call));
       for (const [i, call] of out.toolCalls.entries()) {
-        const result = i < MAX_CALLS_PER_STEP ? await runTool(ctx, call.function.name, call.function.arguments) : { error: "Too many tool calls at once. Ask for fewer." };
-        let json = JSON.stringify(result);
+        let json = JSON.stringify(results[i]);
         if (json.length > MAX_TOOL_RESULT_CHARS) json = JSON.stringify({ error: "That result was too large. Ask for a shorter range or fewer items." });
         collectAllowed(JSON.parse(json), allowed);
         for (const n of allowed.amounts) ctx.known.add(n);

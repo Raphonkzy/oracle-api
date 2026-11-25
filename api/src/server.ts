@@ -27,7 +27,7 @@ const auth = createAuth({
   trustedOrigins: config.corsOrigins,
   mailer,
 });
-const app = createApp({ auth, db, signupMode: config.signupMode, corsOrigins: config.corsOrigins, log: true, ai: config.ai ? createAiClient(config.ai) : null, aiPerHour: config.aiPerHour, passwordReset: mailer !== null });
+const app = createApp({ auth, db, signupMode: config.signupMode, corsOrigins: config.corsOrigins, log: true, ai: config.ai ? createAiClient({ ...config.ai, reasoningEffort: config.aiReasoningEffort }) : null, aiPerHour: config.aiPerHour, passwordReset: mailer !== null });
 
 const server = serve({ fetch: app.fetch, port: config.port }, (info) => {
   console.log(`Oracle API listening on http://localhost:${info.port} (sign-up: ${config.signupMode}, assistant: ${config.ai ? config.ai.model : "off"}, password reset email: ${mailer ? "on" : "off"})`);

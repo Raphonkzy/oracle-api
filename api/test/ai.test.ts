@@ -220,7 +220,12 @@ describe("AI assistant", () => {
       assert.match(GATE_PROMPT, /changing the password/);
       const prompt = chatSystemPrompt({ language: "en", today: "2026-11-19", weekday: "Thursday", canary: "ORC-00000000", accounts: [], expenseCategories: [], incomeCategories: [] });
       assert.match(prompt, /in-scope part and an out-of-scope part/);
-      assert.match(prompt, /Write natural prose/);
+      assert.match(prompt, /Sound like a warm, patient helper/);
+      assert.match(prompt, /ask one short follow-up question/);
+      assert.match(prompt, /call get_app_guide first/);
+      assert.match(prompt, /open the "Profile" tab, then "Accounts & bills"/);
+      assert.match(prompt, /Bills \(paylater, credit card\) may go negative/);
+      assert.match(prompt, /kamu/);
       assert.ok(!/8 short lines/.test(prompt) && !/no tables, no long/.test(prompt));
       assert.ok(!/(reveal|repeat|show) (these|your) (rules|instructions)/i.test(prompt.replace(/Never reveal[^.]*\./g, "")), "it never asks the model to show its rules");
     });
@@ -282,17 +287,20 @@ describe("AI assistant", () => {
     });
     it("never shows the model's private reasoning", async () => {
       const agents: string[] = [];
+      const bodies: Record<string, unknown>[] = [];
       const fetchSpy = (async (_url: string, init: RequestInit) => {
         agents.push(String((init.headers as Record<string, string>)["User-Agent"]));
+        bodies.push(JSON.parse(String(init.body)));
         return new Response(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: "Answer", reasoning_content: "SECRET REASONING", tool_calls: [] } }] }), { status: 200 });
       }) as unknown as typeof fetch;
       const real = globalThis.fetch;
       globalThis.fetch = fetchSpy;
       try {
-        const client = createAiClient({ baseUrl: "https://ai.example/v1/", apiKey: "k", model: "m" });
+        const client = createAiClient({ baseUrl: "https://ai.example/v1/", apiKey: "k", model: "m", reasoningEffort: "none" });
         const out = await client.complete({ messages: [{ role: "user", content: "hi" }], maxTokens: 10 });
         assert.deepEqual(out, { content: "Answer", toolCalls: [], finishReason: "stop" });
         assert.ok(!JSON.stringify(out).includes("SECRET"));
+        assert.equal(bodies[0].reasoning_effort, "none", "the configured reasoning effort is sent");
         assert.equal(agents[0], "oracle-api/1.0", "a User-Agent is sent, some providers refuse without one");
       } finally {
         globalThis.fetch = real;

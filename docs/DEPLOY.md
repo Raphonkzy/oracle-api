@@ -48,7 +48,7 @@ The important values:
 - `POSTGRES_PASSWORD` and `BETTER_AUTH_SECRET`: from the commands above.
 - `SIGNUP_MODE`: `closed` (only the first account can be created) or `open`.
 - `CORS_ORIGINS`: the web addresses allowed to call the API from a browser, separated by commas (for example `https://app.example.com`). Leave it empty if there is no web version. The session cookie only reaches the API when the web app and the API share a site (subdomains of the same domain).
-- `AI_BASE_URL`, `AI_API_KEY`, `AI_MODEL`: an OpenAI-compatible endpoint. Leave `AI_API_KEY` empty to turn the AI off. `AI_RATE_PER_HOUR` limits each person's usage.
+- `AI_BASE_URL`, `AI_API_KEY`, `AI_MODEL`: an OpenAI-compatible endpoint. Leave `AI_API_KEY` empty to turn the AI off. `AI_REASONING_EFFORT` (default `none`) is sent as `reasoning_effort`; leave it empty to send no such field. `AI_RATE_PER_HOUR` limits each person's usage.
 - `SMTP_*`: for password reset codes by email. Leave them empty if you do not use email (use `sh reset-password.sh` instead).
 
 This file must never go into git. The repository ignores it.
