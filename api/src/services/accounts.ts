@@ -92,6 +92,8 @@ export async function updateAccount(
   id: string,
   patch: Partial<Pick<AccountInput, "name" | "type" | "initialBalance" | "includeInTotal">>,
 ): Promise<Account> {
+  // Ownership first: a foreign or missing id throws 404 here, before any row lock is taken on it.
+  await getAccount(db, userId, id);
   // A lower opening balance or a type change can also push the account below zero, so it passes the same check.
   const updated = await db.transaction((tx) =>
     guardOverdraft(tx, [id], () =>

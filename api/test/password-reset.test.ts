@@ -101,7 +101,7 @@ describe("forgot password", () => {
     const limited = await createContext({ mailer: new FakeMailer(), authRateLimit: true });
     await limited.signUp("rate@example.com", "Rate");
     const ask = (ip: string) =>
-      limited.app.request("/api/auth/email-otp/request-password-reset", { ...json({ email: "rate@example.com" }), headers: { origin: "http://localhost:3200", "content-type": "application/json", "x-forwarded-for": ip } });
+      limited.app.request("/api/auth/email-otp/request-password-reset", { ...json({ email: "rate@example.com" }), headers: { origin: "http://localhost:3200", "content-type": "application/json", "cf-connecting-ip": ip } });
     const statuses: number[] = [];
     for (let i = 0; i < 5; i += 1) statuses.push((await ask("203.0.113.9")).status);
     assert.deepEqual(statuses.slice(0, 3), [200, 200, 200]);

@@ -64,8 +64,10 @@ export function createAuth(opts: {
           ]
         : []),
     ],
-    // Behind the Cloudflare Tunnel the real client address arrives in these headers. The API port is never published, so only the tunnel can set them.
-    advanced: { ipAddress: { ipAddressHeaders: ["cf-connecting-ip", "x-forwarded-for"] } },
+    // The API is reachable only through the Cloudflare Tunnel, and the tunnel sets cf-connecting-ip to the real client address.
+    // x-forwarded-for is not read: any caller can set it. A request without cf-connecting-ip gets no client IP, so Better Auth
+    // puts it in one shared rate-limit bucket per path (outside development and test, where it uses 127.0.0.1).
+    advanced: { ipAddress: { ipAddressHeaders: ["cf-connecting-ip"] } },
     database: drizzleAdapter(db, {
       provider: "pg",
       schema: { user: schema.user, session: schema.session, account: schema.account, verification: schema.verification },

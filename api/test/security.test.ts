@@ -143,3 +143,66 @@ describe("access log", () => {
     assert.ok(!lines.join("\n").match(/secret|SECRET|hunter2|\?/));
   });
 });
+
+describe("rateLimit client key ignores X-Forwarded-For (SEC-02)", () => {
+  const limited = () => {
+    const app = new Hono();
+    app.use("*", rateLimit({ max: 2, windowMs: 60_000 }));
+    app.get("/", (c) => c.text("ok"));
+    return app;
+  };
+  const hit = async (app: Hono, headers: Record<string, string>) => (await app.request("/", { headers })).status;
+
+  it("a spoofed X-Forwarded-For with the same cf-connecting-ip still shares one limit", async () => {
+    const app = limited();
+    const cf = { "cf-connecting-ip": "198.51.100.1" };
+    const statuses = [
+      await hit(app, { ...cf, "x-forwarded-for": "10.0.0.1, 192.168.1.1" }),
+      await hit(app, { ...cf, "x-forwarded-for": "10.0.0.2, 192.168.1.1" }),
+      await hit(app, { ...cf, "x-forwarded-for": "10.0.0.3, 192.168.1.1" }),
+    ];
+    assert.deepEqual(statuses, [200, 200, 429], "rotating the forged value does not reset the limit");
+  });
+
+  it("a spoofed X-Forwarded-For with a new cf-connecting-ip gets a new bucket", async () => {
+    const app = limited();
+    const xff = { "x-forwarded-for": "10.0.0.1" };
+    assert.deepEqual(
+      [
+        await hit(app, { ...xff, "cf-connecting-ip": "198.51.100.10" }),
+        await hit(app, { ...xff, "cf-connecting-ip": "198.51.100.10" }),
+        await hit(app, { ...xff, "cf-connecting-ip": "198.51.100.10" }),
+      ],
+      [200, 200, 429],
+    );
+    assert.equal(await hit(app, { ...xff, "cf-connecting-ip": "198.51.100.11" }), 200, "another real client is not affected");
+  });
+
+  it("without cf-connecting-ip, X-Forwarded-For is never read: every caller shares the direct bucket", async () => {
+    const app = limited();
+    const statuses = [
+      await hit(app, { "x-forwarded-for": "10.0.0.1" }),
+      await hit(app, { "x-forwarded-for": "10.0.0.2" }),
+      await hit(app, { "x-forwarded-for": "10.0.0.3" }),
+    ];
+    assert.deepEqual(statuses, [200, 200, 429]);
+  });
+});
+
+describe("sign-in limit (Better Auth) ignores X-Forwarded-For (SEC-02)", () => {
+  it("a spoofed X-Forwarded-For with the same cf-connecting-ip is still limited on sign-in", async () => {
+    const ctx = await createContext({ authRateLimit: true });
+    await ctx.signUp("login@example.com");
+    const attempt = (xff: string) =>
+      ctx.app.request("/api/auth/sign-in/email", {
+        method: "POST",
+        headers: { origin: "http://localhost:3200", "content-type": "application/json", "cf-connecting-ip": "198.51.100.20", "x-forwarded-for": xff },
+        body: JSON.stringify({ email: "login@example.com", password: "wrong-password-1" }),
+      });
+    const statuses: number[] = [];
+    for (let i = 0; i < 6; i += 1) statuses.push((await attempt(`10.0.0.${i + 1}`)).status);
+    assert.ok(statuses.slice(0, 5).every((s) => s !== 429), `the first five attempts are not refused: ${statuses}`);
+    assert.equal(statuses[5], 429, "rotating the forged X-Forwarded-For does not reset the sign-in limit");
+    await ctx.close();
+  });
+});

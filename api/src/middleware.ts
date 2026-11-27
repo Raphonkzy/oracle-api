@@ -18,8 +18,12 @@ export const noStore = (): MiddlewareHandler => async (c, next) => {
 
 export type RateLimitOptions = { max: number; windowMs: number };
 
-/** The caller's address as the Cloudflare Tunnel reports it. Without a proxy in front, everyone shares one bucket. */
-const clientKey = (headers: Headers) => headers.get("cf-connecting-ip") ?? headers.get("x-forwarded-for")?.split(",")[0].trim() ?? "direct";
+/**
+ * The caller's address as the Cloudflare Tunnel reports it in cf-connecting-ip. The tunnel always sets this header.
+ * X-Forwarded-For is deliberately not read: a client can send any value in it, so it would let one client pick a new bucket per request.
+ * Without cf-connecting-ip (no tunnel in front, e.g. local tests), every caller shares the one bucket "direct".
+ */
+const clientKey = (headers: Headers) => headers.get("cf-connecting-ip") || "direct";
 
 /**
  * A fixed-window limit per client address, kept in memory. It is a safety net against a runaway client or a guessing

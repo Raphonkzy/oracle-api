@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
+import { updateAccount } from "../src/services/accounts";
 import { balanceOf, createContext, seedAccounts, type Client, type TestContext } from "./helpers";
 
 const acct = (over: Record<string, unknown> = {}) => ({
@@ -169,5 +170,50 @@ describe("accounts", () => {
     assert.ok(!active.includes(ids.DANA));
     assert.equal((await c.post("/api/v1/accounts/reorder", { ids: [...active, ids.DANA] })).status, 400);
     assert.equal((await c.post("/api/v1/accounts/reorder", { ids: [...active].reverse() })).status, 200);
+  });
+});
+
+describe("account ownership before row locks", () => {
+  let ctx: TestContext;
+  let alice: Client;
+  let bob: Client;
+  let bobIds: Awaited<ReturnType<typeof seedAccounts>>;
+  before(async () => {
+    ctx = await createContext();
+    alice = await ctx.signUp("alice-lock@example.com");
+    bob = await ctx.signUp("bob-lock@example.com");
+    bobIds = await seedAccounts(bob);
+  });
+  after(async () => ctx.close());
+
+  it("a foreign account id gives 404 and no transaction (no row lock) is started", async () => {
+    // Records every database method the service calls, so a lock taken on Bob's row would show up as a transaction.
+    const calls: string[] = [];
+    const spied = new Proxy(ctx.db, {
+      get(target, prop) {
+        const value = Reflect.get(target, prop, target);
+        if (typeof value !== "function") return value;
+        return (...args: unknown[]) => {
+          calls.push(String(prop));
+          return value.apply(target, args);
+        };
+      },
+    }) as typeof ctx.db;
+    const aliceId = (await alice.get("/api/v1/me")).body.user.id as string;
+    await assert.rejects(updateAccount(spied, aliceId, bobIds.myBCA, { name: "Hijack" }), (e: { status?: number }) => e.status === 404);
+    assert.ok(!calls.includes("transaction"), `no transaction expected, got calls: ${calls.join(", ")}`);
+    assert.equal((await bob.get(`/api/v1/accounts/${bobIds.myBCA}`)).body.account.name, "myBCA", "Bob's account is unchanged");
+  });
+
+  it("a foreign account id gives 404 over HTTP and leaves Bob's account unchanged", async () => {
+    const res = await alice.patch(`/api/v1/accounts/${bobIds.myBCA}`, { name: "Hijack", initialBalance: 0 });
+    assert.equal(res.status, 404);
+    assert.equal((await bob.get(`/api/v1/accounts/${bobIds.myBCA}`)).body.account.name, "myBCA");
+  });
+
+  it("an own account still updates", async () => {
+    const res = await bob.patch(`/api/v1/accounts/${bobIds.myBCA}`, { name: "myBCA 2" });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.account.name, "myBCA 2");
   });
 });
